@@ -9,6 +9,7 @@ Single-file Railway build.
 Required environment variables:
 BOT_TOKEN
 OWNER_ID
+OWNER_USERNAME
 API_ID
 API_HASH
 
@@ -58,6 +59,7 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "93496624"))
+OWNER_USERNAME = os.getenv("OWNER_USERNAME", "krofullpower").strip().lstrip("@")
 API_ID_RAW = os.getenv("API_ID", "").strip()
 API_HASH = os.getenv("API_HASH", "").strip()
 
@@ -341,7 +343,7 @@ async def send_start(
             "هذا البوت غير متاح لحسابك."
         )
         keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("التواصل مع المالك", url="https://t.me/isMohnd")]]
+            [[InlineKeyboardButton("التواصل مع المالك", url=f"https://t.me/{OWNER_USERNAME}")]]
         )
     else:
         text = (
