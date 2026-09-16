@@ -1,1097 +1,1489 @@
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-Telegram Username Availability Monitor Bot
---------------------------------------------
-Single-file version, meant for GitHub + Railway deployment.
+Telegram Ownership Protection Bot
+Single-file Railway build.
 
-What it does
-------------
-- Runs a control-panel bot (aiogram) with inline buttons.
-- Logs in to a Telegram user account directly through the bot: you send the
-  phone number, then the login code, then the 2FA password if needed. No
-  need to generate a session string offline.
-- Monitors a list of usernames for availability using that account.
-- When a username becomes available, it creates a new channel or group and
-  assigns the username to it (a personal account can only hold a single
-  username, so claimed usernames are parked on fresh channels/groups
-  instead, with no limit other than Telegram's channel-count cap).
-- Handles FloodWait automatically and uses adaptive polling (slows down
-  after a FloodWait, speeds back up after a run of clean checks).
-- Persists usernames and settings in SQLite.
+Required environment variables:
+BOT_TOKEN
+OWNER_ID
+API_ID
+API_HASH
 
-Environment variables (set these in Railway's Variables tab)
---------------------------------------------------------------
-    API_ID           Telegram API ID (from my.telegram.org)
-    API_HASH         Telegram API hash
-    BOT_TOKEN        Control bot token (from BotFather)
-    OWNER_ID         Your Telegram user ID (only this ID can use the bot)
-    SESSION_STRING   Optional. If set, login is skipped and this session is
-                      used directly. If not set, use the "Login" button in
-                      the bot to authenticate interactively; the resulting
-                      session string is then sent to you so you can save it
-                      here for future deploys (Railway's filesystem is not
-                      guaranteed to persist across redeploys).
-    DB_PATH          Optional. Defaults to "monitor.db".
-    DEFAULT_INTERVAL Optional. Base polling interval in seconds, default 2.
-    DEFAULT_TARGET_TYPE  Optional. "channel" or "group", default "channel".
-
-Run
----
-    pip install -r requirements.txt
-    python main.py
+Optional:
+DATA_FILE=bot_data.json
+VIDEO_URL=
 """
 
 import asyncio
-import logging
+import json
 import os
+import re
 import sys
-import time
-from datetime import datetime, timezone
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
-import aiosqlite
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, Message
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.functions.account import CheckUsernameRequest
-from telethon.tl.functions.channels import (
-    CreateChannelRequest,
-    UpdateUsernameRequest as ChannelUpdateUsername,
-)
 from telethon.errors import (
-    FloodWaitError,
-    UsernameInvalidError,
-    UsernameOccupiedError,
-    UsernameNotModifiedError,
-    ChannelsTooMuchError,
-    PhoneCodeInvalidError,
-    PhoneCodeExpiredError,
-    PhoneNumberInvalidError,
     SessionPasswordNeededError,
-    PasswordHashInvalidError,
+    FloodWaitError,
+    AuthKeyUnregisteredError,
+    AuthKeyDuplicatedError,
+    UserDeactivatedBanError,
+    PhoneCodeInvalidError,
+    PhoneNumberInvalidError,
+)
+from telethon.tl.functions.channels import LeaveChannelRequest
+from telethon.tl.functions.messages import DeleteChatUserRequest
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.request import HTTPXRequest
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("username_monitor")
+# ============================================================
+# Configuration
+# ============================================================
 
-# ===========================================================================
-# Config
-# ===========================================================================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OWNER_ID = int(os.getenv("OWNER_ID", "93496624"))
+API_ID_RAW = os.getenv("API_ID", "").strip()
+API_HASH = os.getenv("API_HASH", "").strip()
 
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-SESSION_STRING_ENV = os.getenv("SESSION_STRING", "")
-DB_PATH = os.getenv("DB_PATH", "monitor.db")
+DATA_FILE = os.getenv("DATA_FILE", "bot_data.json")
+VIDEO_URL = os.getenv("VIDEO_URL", "").strip()
 
-DEFAULT_INTERVAL = float(os.getenv("DEFAULT_INTERVAL", "2"))
-DEFAULT_ADAPTIVE = True
-DEFAULT_FLOODWAIT_AUTO = True
-DEFAULT_TARGET_TYPE = os.getenv("DEFAULT_TARGET_TYPE", "channel")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing.")
+if not API_ID_RAW.isdigit():
+    raise RuntimeError("API_ID is missing or invalid.")
+if not API_HASH:
+    raise RuntimeError("API_HASH is missing.")
 
-MAX_INTERVAL = 60.0
-MIN_INTERVAL = 0.5
+API_ID = int(API_ID_RAW)
 
+# ============================================================
+# Runtime state
+# ============================================================
 
-def validate_config() -> list[str]:
-    errors = []
-    if not API_ID:
-        errors.append("API_ID is not set")
-    if not API_HASH:
-        errors.append("API_HASH is not set")
-    if not BOT_TOKEN:
-        errors.append("BOT_TOKEN is not set")
-    if not OWNER_ID:
-        errors.append("OWNER_ID is not set")
-    return errors
+active_monitors: dict[int, TelegramClient] = {}
+monitor_tasks: dict[int, asyncio.Task] = {}
+login_clients: dict[int, TelegramClient] = {}
+login_locks: dict[int, asyncio.Lock] = {}
+data_lock = asyncio.Lock()
 
+LOGIN_PHONE = 1
+LOGIN_CODE = 2
+LOGIN_PASSWORD = 3
+MANAGE_ADD_USER = 4
 
-# ===========================================================================
-# Database
-# ===========================================================================
+FATAL_SESSION_ERRORS = (
+    AuthKeyUnregisteredError,
+    AuthKeyDuplicatedError,
+    UserDeactivatedBanError,
+)
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS usernames (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    status TEXT NOT NULL DEFAULT 'watching',
-    added_at REAL,
-    last_checked_at REAL,
-    checks_count INTEGER NOT NULL DEFAULT 0,
-    assigned_at REAL,
-    channel_id INTEGER,
-    channel_link TEXT
-);
+app: Optional[Application] = None
 
-CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
-"""
+# ============================================================
+# Data layer
+# ============================================================
 
+def _default_data() -> dict:
+    return {
+        "users": {},
+        "allowed": [str(OWNER_ID)],
+        "settings": {
+            "auto_leave": True,
+            "notify_user": True,
+        },
+    }
 
-class Database:
-    def __init__(self, path: str):
-        self.path = path
-        self._conn: Optional[aiosqlite.Connection] = None
+def load_data() -> dict:
+    path = Path(DATA_FILE)
 
-    async def init(self, defaults: dict):
-        self._conn = await aiosqlite.connect(self.path)
-        self._conn.row_factory = aiosqlite.Row
-        await self._conn.executescript(SCHEMA)
-        await self._conn.commit()
-        for key, value in defaults.items():
-            await self._conn.execute(
-                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
-                (key, str(value)),
-            )
-        await self._conn.commit()
+    if not path.exists():
+        return _default_data()
 
-    async def close(self):
-        if self._conn:
-            await self._conn.close()
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
 
-    # ---------- usernames ----------
+        if not isinstance(data, dict):
+            return _default_data()
 
-    async def add_username(self, username: str) -> bool:
-        username = username.lstrip("@").lower()
+        data.setdefault("users", {})
+        data.setdefault("allowed", [str(OWNER_ID)])
+        data.setdefault("settings", {})
+        data["settings"].setdefault("auto_leave", True)
+        data["settings"].setdefault("notify_user", True)
+
+        if str(OWNER_ID) not in [str(x) for x in data["allowed"]]:
+            data["allowed"].append(str(OWNER_ID))
+
+        return data
+
+    except (json.JSONDecodeError, OSError):
+        broken = path.with_suffix(".broken.json")
         try:
-            await self._conn.execute(
-                "INSERT INTO usernames (username, status, added_at) VALUES (?, 'watching', ?)",
-                (username, time.time()),
+            if path.exists():
+                path.replace(broken)
+        except OSError:
+            pass
+        return _default_data()
+
+def save_data(data: dict) -> None:
+    path = Path(DATA_FILE)
+    tmp = path.with_suffix(".tmp")
+
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+    tmp.replace(path)
+
+def get_user(user_id: int) -> Optional[dict]:
+    data = load_data()
+    return data["users"].get(str(user_id))
+
+def set_user(
+    user_id: int,
+    phone: str,
+    session_string: str,
+    frozen: bool = False,
+) -> None:
+    data = load_data()
+    old = data["users"].get(str(user_id), {})
+
+    data["users"][str(user_id)] = {
+        "phone": phone,
+        "session_string": session_string,
+        "added_at": old.get("added_at", datetime.now().isoformat()),
+        "updated_at": datetime.now().isoformat(),
+        "frozen": bool(frozen),
+    }
+
+    save_data(data)
+
+def update_user(user_id: int, **changes) -> bool:
+    data = load_data()
+    key = str(user_id)
+
+    if key not in data["users"]:
+        return False
+
+    data["users"][key].update(changes)
+    data["users"][key]["updated_at"] = datetime.now().isoformat()
+    save_data(data)
+    return True
+
+def delete_user(user_id: int) -> None:
+    data = load_data()
+    data["users"].pop(str(user_id), None)
+    save_data(data)
+
+def is_allowed(user_id: int) -> bool:
+    if user_id == OWNER_ID:
+        return True
+
+    data = load_data()
+    return str(user_id) in {str(x) for x in data.get("allowed", [])}
+
+def add_allowed_user(user_id: int) -> None:
+    data = load_data()
+    allowed = {str(x) for x in data.get("allowed", [])}
+    allowed.add(str(user_id))
+    data["allowed"] = sorted(allowed)
+    save_data(data)
+
+def remove_allowed_user(user_id: int) -> None:
+    data = load_data()
+    data["allowed"] = [
+        str(x)
+        for x in data.get("allowed", [])
+        if str(x) != str(user_id) and str(x) != str(OWNER_ID)
+    ]
+    save_data(data)
+
+def list_allowed_users() -> list[int]:
+    result = []
+    for uid in load_data().get("allowed", []):
+        try:
+            result.append(int(uid))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+def add_log(user_id: int, event_name: str, details: str = "") -> None:
+    # Bounded, simple local log. It never contains session strings or passwords.
+    try:
+        with open("activity.log", "a", encoding="utf-8") as f:
+            f.write(
+                f"{datetime.now().isoformat()} | "
+                f"User {user_id} | {event_name} | {details[:500]}\n"
             )
-            await self._conn.commit()
+    except OSError:
+        pass
+
+# ============================================================
+# UI
+# ============================================================
+
+def main_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("الحماية", callback_data="status")],
+        [
+            InlineKeyboardButton("تسجيل الدخول", callback_data="login"),
+            InlineKeyboardButton("فحص القديم", callback_data="scan"),
+        ],
+        [InlineKeyboardButton("إدارة الجلسة", callback_data="session")],
+    ]
+
+    if user_id == OWNER_ID:
+        rows.append([InlineKeyboardButton("لوحة المالك", callback_data="manage")])
+
+    return InlineKeyboardMarkup(rows)
+
+def back_keyboard(target: str = "main") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("رجوع", callback_data=target)]]
+    )
+
+def status_keyboard(frozen: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "إلغاء التجميد" if frozen else "تجميد الحماية",
+                    callback_data="freeze",
+                )
+            ],
+            [InlineKeyboardButton("تحديث", callback_data="status")],
+            [InlineKeyboardButton("رجوع", callback_data="main")],
+        ]
+    )
+
+def management_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("إضافة مستخدم", callback_data="manage_add")],
+            [InlineKeyboardButton("حذف مستخدم", callback_data="manage_remove")],
+            [InlineKeyboardButton("المستخدمون", callback_data="manage_list")],
+            [InlineKeyboardButton("رجوع", callback_data="main")],
+        ]
+    )
+
+async def safe_edit(
+    query,
+    text: str,
+    keyboard: Optional[InlineKeyboardMarkup] = None,
+) -> None:
+    try:
+        await query.edit_message_text(
+            text=text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    except Exception:
+        pass
+
+    try:
+        await query.edit_message_caption(
+            caption=text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    except Exception:
+        pass
+
+    try:
+        await query.message.reply_text(
+            text=text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+async def send_start(
+    target,
+    user_id: int,
+    query=None,
+) -> None:
+    user = target.from_user if hasattr(target, "from_user") else None
+    full_name = (
+        getattr(user, "full_name", None)
+        or getattr(user, "first_name", None)
+        or "مستخدم"
+    )
+    safe_name = (
+        str(full_name)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+    if not is_allowed(user_id):
+        text = (
+            f"مرحباً <a href=\"tg://user?id={user_id}\">{safe_name}</a>\n\n"
+            "هذا البوت غير متاح لحسابك."
+        )
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("التواصل مع المالك", url="https://t.me/isMohnd")]]
+        )
+    else:
+        text = (
+            f"<b>نظام حماية الحساب</b>\n\n"
+            f"مرحباً <a href=\"tg://user?id={user_id}\">{safe_name}</a>\n\n"
+            "يعمل النظام على مراقبة إشعارات Telegram الرسمية "
+            "والتعامل مع محاولات نقل الملكية تلقائياً.\n\n"
+            "اختر العملية المطلوبة من القائمة."
+        )
+        keyboard = main_keyboard(user_id)
+
+    if query is not None:
+        await safe_edit(query, text, keyboard)
+        return
+
+    if VIDEO_URL:
+        try:
+            await target.reply_video(
+                video=VIDEO_URL,
+                caption=text,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        except Exception:
+            pass
+
+    try:
+        await target.reply_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+# ============================================================
+# Telethon
+# ============================================================
+
+def make_client(session_string: str = "") -> TelegramClient:
+    return TelegramClient(
+        StringSession(session_string),
+        API_ID,
+        API_HASH,
+        connection_retries=-1,
+        retry_delay=5,
+        auto_reconnect=True,
+        flood_sleep_threshold=60,
+        request_retries=5,
+        device_model="Telegram Protection",
+        system_version="1.0",
+        app_version="2.0",
+        lang_code="en",
+        system_lang_code="en",
+    )
+
+async def get_telegram_service(client: TelegramClient):
+    for target in (777000, "telegram"):
+        try:
+            return await client.get_entity(target)
+        except Exception:
+            continue
+    return None
+
+def extract_chat_info(text: str) -> tuple[str, str]:
+    lowered = text.lower()
+
+    if (
+        re.search(r"\bchannel\b", lowered)
+        or re.search(r"قناة|القناة", text, re.I)
+    ):
+        chat_type = "قناة"
+    else:
+        chat_type = "كروب"
+
+    patterns = [
+        r"«\s*(.+?)\s*»",
+        r"“\s*(.+?)\s*”",
+        r'"\s*(.+?)\s*"',
+        r"ownership\s+of\s+the\s+(?:channel|group|supergroup)\s+(.+?)\s+to\b",
+        r"ملكية\s+(?:القناة|القناة)\s+(.+?)\s+إلى",
+        r"ملكية\s+(?:المجموعة|المجموعه)\s+(.+?)\s+إلى",
+        r"\b(?:channel|group|supergroup)\s+(.+?)\s+to\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I | re.S)
+        if match:
+            name = match.group(1).strip().strip(" .،")
+            if name:
+                return name[:150], chat_type
+
+    first_line = text.strip().splitlines()[0] if text.strip() else "غير معروف"
+    return first_line[:100], chat_type
+
+def format_time(dt: datetime) -> str:
+    period = "ص" if dt.hour < 12 else "م"
+    hour = dt.hour % 12 or 12
+    return f"{dt:%d/%m/%Y} - {hour:02d}:{dt:%M} {period}"
+
+async def try_leave_chat(
+    client: TelegramClient,
+    chat_name: str,
+    user_id: int,
+) -> bool:
+    entity = None
+
+    try:
+        entity = await client.get_entity(chat_name)
+    except Exception:
+        pass
+
+    if entity is None:
+        try:
+            async for dialog in client.iter_dialogs():
+                title = getattr(dialog, "title", "") or ""
+                if title and (
+                    title.casefold() == chat_name.casefold()
+                    or chat_name.casefold() in title.casefold()
+                ):
+                    entity = dialog.entity
+                    break
+        except Exception:
+            pass
+
+    if entity is None:
+        add_log(user_id, "leave_skipped", "Entity not found")
+        return False
+
+    try:
+        await client(LeaveChannelRequest(entity))
+        add_log(user_id, "left_chat", chat_name)
+        return True
+    except Exception:
+        pass
+
+    try:
+        entity_id = getattr(entity, "id", None)
+        if entity_id:
+            await client(DeleteChatUserRequest(entity_id, "me"))
+            add_log(user_id, "left_group", chat_name)
             return True
-        except aiosqlite.IntegrityError:
-            return False
+    except Exception as exc:
+        add_log(user_id, "leave_failed", str(exc))
 
-    async def remove_username(self, username: str) -> bool:
-        username = username.lstrip("@").lower()
-        cur = await self._conn.execute("DELETE FROM usernames WHERE username = ?", (username,))
-        await self._conn.commit()
-        return cur.rowcount > 0
+    return False
 
-    async def list_usernames(self) -> list[aiosqlite.Row]:
-        cur = await self._conn.execute("SELECT * FROM usernames ORDER BY id")
-        return await cur.fetchall()
+async def notify_user(
+    user_id: int,
+    client: TelegramClient,
+    text: str,
+) -> None:
+    if not load_data()["settings"].get("notify_user", True):
+        return
 
-    async def get_watching_usernames(self) -> list[str]:
-        cur = await self._conn.execute("SELECT username FROM usernames WHERE status = 'watching'")
-        rows = await cur.fetchall()
-        return [r["username"] for r in rows]
-
-    async def set_status(self, username: str, status: str):
-        await self._conn.execute(
-            "UPDATE usernames SET status = ? WHERE username = ?", (status, username)
-        )
-        await self._conn.commit()
-
-    async def mark_assigned(self, username: str, channel_id: int, channel_link: str):
-        await self._conn.execute(
-            "UPDATE usernames SET status = 'assigned', assigned_at = ?, "
-            "channel_id = ?, channel_link = ? WHERE username = ?",
-            (time.time(), channel_id, channel_link, username),
-        )
-        await self._conn.commit()
-
-    async def increment_check(self, username: str):
-        await self._conn.execute(
-            "UPDATE usernames SET checks_count = checks_count + 1, last_checked_at = ? WHERE username = ?",
-            (time.time(), username),
-        )
-        await self._conn.commit()
-
-    async def get_stats(self) -> dict:
-        cur = await self._conn.execute(
-            "SELECT COUNT(*) AS total, "
-            "SUM(CASE WHEN status='watching' THEN 1 ELSE 0 END) AS watching, "
-            "SUM(CASE WHEN status='assigned' THEN 1 ELSE 0 END) AS assigned, "
-            "SUM(checks_count) AS total_checks, "
-            "MAX(last_checked_at) AS last_check "
-            "FROM usernames"
-        )
-        row = await cur.fetchone()
-        return dict(row) if row else {}
-
-    # ---------- settings ----------
-
-    async def get_setting(self, key: str, default=None) -> str:
-        cur = await self._conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
-        row = await cur.fetchone()
-        return row["value"] if row else default
-
-    async def set_setting(self, key: str, value):
-        await self._conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, str(value)),
-        )
-        await self._conn.commit()
-
-
-# ===========================================================================
-# Monitor engine
-# ===========================================================================
-
-class MonitorEngine:
-    def __init__(self, db: Database, notify):
-        self.db = db
-        self.notify = notify
-
-        self.client: Optional[TelegramClient] = None
-        self.account_label: str = "not logged in"
-
-        self.is_active = False
-        self._task: Optional[asyncio.Task] = None
-
-        self.base_interval = DEFAULT_INTERVAL
-        self.current_interval = self.base_interval
-        self.adaptive_enabled = DEFAULT_ADAPTIVE
-        self.floodwait_auto = DEFAULT_FLOODWAIT_AUTO
-        self.target_type = DEFAULT_TARGET_TYPE
-        self._consecutive_ok = 0
-
-        self.total_checks = 0
-        self.last_check_time: Optional[float] = None
-        self.last_floodwait: Optional[dict] = None
-
-    async def load_settings(self):
-        self.base_interval = float(await self.db.get_setting("interval", self.base_interval))
-        self.current_interval = self.base_interval
-        self.adaptive_enabled = (await self.db.get_setting("adaptive", "1")) == "1"
-        self.floodwait_auto = (await self.db.get_setting("floodwait_auto", "1")) == "1"
-        self.target_type = await self.db.get_setting("target_type", self.target_type)
-
-    async def set_interval(self, seconds: float):
-        seconds = max(MIN_INTERVAL, seconds)
-        self.base_interval = seconds
-        self.current_interval = seconds
-        await self.db.set_setting("interval", seconds)
-
-    async def set_adaptive(self, enabled: bool):
-        self.adaptive_enabled = enabled
-        await self.db.set_setting("adaptive", "1" if enabled else "0")
-
-    async def set_floodwait_auto(self, enabled: bool):
-        self.floodwait_auto = enabled
-        await self.db.set_setting("floodwait_auto", "1" if enabled else "0")
-
-    async def set_target_type(self, target_type: str):
-        assert target_type in ("channel", "group")
-        self.target_type = target_type
-        await self.db.set_setting("target_type", target_type)
-
-    def attach_client(self, client: TelegramClient, label: str):
-        self.client = client
-        self.account_label = label
-
-    async def detach_client(self):
-        self.stop()
-        if self.client:
-            await self.client.disconnect()
-        self.client = None
-        self.account_label = "not logged in"
-
-    # ---------- start / stop ----------
-
-    def start(self):
-        if self.is_active or self.client is None:
-            return
-        self.is_active = True
-        self._task = asyncio.create_task(self._loop())
-
-    def stop(self):
-        self.is_active = False
-        if self._task:
-            self._task.cancel()
-            self._task = None
-
-    async def _loop(self):
+    if app is not None:
         try:
-            while self.is_active:
-                usernames = await self.db.get_watching_usernames()
-                if not usernames:
-                    await asyncio.sleep(2)
-                    continue
-                for uname in usernames:
-                    if not self.is_active:
-                        break
-                    await self.check_username(uname)
-                    await asyncio.sleep(self.current_interval)
+            await app.bot.send_message(chat_id=user_id, text=text)
+            return
+        except Exception:
+            pass
+
+    try:
+        await client.send_message("me", text)
+    except Exception:
+        pass
+
+async def invalidate_session(user_id: int, reason: str) -> None:
+    add_log(user_id, "session_invalid", reason)
+    stop_monitoring(user_id)
+    delete_user(user_id)
+
+    if app is not None:
+        try:
+            await app.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "<b>تم إيقاف الجلسة</b>\n\n"
+                    "أصبحت الجلسة غير صالحة.\n"
+                    f"السبب: {reason}\n\n"
+                    "أعد تسجيل الدخول من القائمة."
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard(user_id),
+            )
+        except Exception:
+            pass
+
+async def keepalive_task(
+    client: TelegramClient,
+    user_id: int,
+) -> None:
+    while True:
+        try:
+            await asyncio.sleep(240)
+            if client.is_connected():
+                await client.get_me()
         except asyncio.CancelledError:
-            pass
-
-    # ---------- checking ----------
-
-    async def check_username(self, uname: str):
-        if self.client is None:
             return
+        except Exception as exc:
+            add_log(user_id, "keepalive_error", str(exc))
+
+async def handle_transfer_event(
+    event,
+    user_id: int,
+    client: TelegramClient,
+) -> None:
+    if event.out:
+        return
+
+    user_data = get_user(user_id)
+    if not user_data or user_data.get("frozen"):
+        return
+
+    message = event.message
+    text = message.raw_text or ""
+
+    if not message.buttons:
+        return
+
+    add_log(user_id, "transfer_detected", "Ownership transfer detected")
+
+    chat_name, chat_type = extract_chat_info(text)
+    now = datetime.now()
+
+    try:
+        # The first button is the Telegram confirmation/rejection action
+        # present in the service notification.
+        await message.buttons[0][0].click()
+
+        add_log(
+            user_id,
+            "transfer_rejected",
+            f"{chat_type}: {chat_name}",
+        )
+
+        left = False
+        if load_data()["settings"].get("auto_leave", True):
+            left = await try_leave_chat(client, chat_name, user_id)
+
+        leave_text = "\nالحالة: تم الخروج تلقائياً" if left else ""
+
+        notification = (
+            "<b>تمت حماية الحساب</b>\n\n"
+            f"النوع: {chat_type}\n"
+            f"الاسم: {chat_name}\n"
+            f"الوقت: {format_time(now)}\n"
+            "الإجراء: تم رفض محاولة نقل الملكية"
+            f"{leave_text}"
+        )
+
+        await notify_user(user_id, client, notification)
+
+    except FloodWaitError as exc:
+        add_log(user_id, "transfer_flood", f"{exc.seconds}s")
+        await asyncio.sleep(min(exc.seconds, 300))
+    except Exception as exc:
+        add_log(user_id, "transfer_error", str(exc))
+
+async def monitor_loop(user_id: int, session_string: str) -> None:
+    retry_delay = 5
+    max_delay = 300
+
+    while True:
+        client = None
+        keepalive = None
+
         try:
-            available = await self.client(CheckUsernameRequest(uname))
-            self.total_checks += 1
-            self.last_check_time = time.time()
-            await self.db.increment_check(uname)
-            self._decay_interval()
+            if not get_user(user_id):
+                break
 
-            if available:
-                await self.notify(f"Username @{uname} is now available.\nAttempting to claim it now...")
-                await self._try_claim(uname)
+            client = make_client(session_string)
 
-        except UsernameOccupiedError:
-            self.total_checks += 1
-            self.last_check_time = time.time()
-            await self.db.increment_check(uname)
-            self._decay_interval()
+            try:
+                await asyncio.wait_for(client.connect(), timeout=60)
+            except asyncio.TimeoutError:
+                raise ConnectionError("Telegram connection timed out")
 
-        except UsernameInvalidError:
-            await self.db.set_status(uname, "invalid")
-            await self.notify(f"Username @{uname} is invalid (rejected by Telegram) — monitoring stopped.")
+            if not await client.is_user_authorized():
+                await invalidate_session(
+                    user_id,
+                    "الجلسة لم تعد مصادقاً عليها",
+                )
+                break
 
-        except FloodWaitError as e:
-            self.last_floodwait = {"seconds": e.seconds, "at": time.time()}
-            self._increase_interval()
-            await self.notify(
-                f"FloodWait: Telegram asked to wait {e.seconds} seconds.\n"
-                f"Interval automatically raised to {round(self.current_interval, 1)} seconds."
+            active_monitors[user_id] = client
+
+            @client.on(events.NewMessage(incoming=True, chats=777000))
+            async def ownership_handler(event, _uid=user_id, _client=client):
+                await handle_transfer_event(event, _uid, _client)
+
+            keepalive = asyncio.create_task(
+                keepalive_task(client, user_id),
+                name=f"keepalive_{user_id}",
             )
-            if self.floodwait_auto:
-                await asyncio.sleep(e.seconds + 2)
 
-        except Exception as e:  # noqa: BLE001
-            await self.notify(f"Unexpected error while checking @{uname}:\n{e}")
+            retry_delay = 5
+            await client.run_until_disconnected()
 
-    async def _try_claim(self, uname: str):
-        try:
-            channel_id, link = await self._create_and_assign(uname)
-            await self.db.mark_assigned(uname, channel_id, link)
-            kind = "channel" if self.target_type == "channel" else "group"
-            await self.notify(f"Created a {kind} and assigned @{uname} to it.\nLink: {link}")
-        except UsernameOccupiedError:
-            await self.notify(f"Missed @{uname} — someone else claimed it first.")
-        except UsernameNotModifiedError:
-            pass
-        except ChannelsTooMuchError:
-            await self.notify(
-                f"Cannot create a new channel/group for @{uname} — "
-                f"this account has reached Telegram's channel/group limit."
-            )
-            await self.db.set_status(uname, "stopped")
-        except FloodWaitError as e:
-            await self.notify(f"FloodWait while claiming: must wait {e.seconds} seconds.")
-            if self.floodwait_auto:
-                await asyncio.sleep(e.seconds + 2)
+        except asyncio.CancelledError:
+            break
+
+        except FATAL_SESSION_ERRORS as exc:
+            await invalidate_session(user_id, str(exc))
+            break
+
+        except Exception as exc:
+            error_text = str(exc)
+
+            if (
+                "key is not registered" in error_text.lower()
+                or "auth_key_unregistered" in error_text.lower()
+            ):
+                await invalidate_session(
+                    user_id,
+                    "مفتاح الجلسة غير مسجل",
+                )
+                break
+
+            add_log(user_id, "monitor_error", error_text)
+
+        finally:
+            if keepalive and not keepalive.done():
+                keepalive.cancel()
                 try:
-                    channel_id, link = await self._create_and_assign(uname)
-                    await self.db.mark_assigned(uname, channel_id, link)
-                    await self.notify(f"Assigned @{uname} successfully after waiting.\nLink: {link}")
-                except Exception as e2:  # noqa: BLE001
-                    await self.notify(f"Second attempt to claim @{uname} failed:\n{e2}")
-        except Exception as e:  # noqa: BLE001
-            await self.notify(f"Failed to claim @{uname}:\n{e}")
+                    await keepalive
+                except asyncio.CancelledError:
+                    pass
 
-    async def _create_and_assign(self, uname: str) -> tuple[int, str]:
-        is_group = self.target_type == "group"
-        result = await self.client(
-            CreateChannelRequest(title=f"@{uname}", about="", megagroup=is_group)
-        )
-        new_chat = result.chats[0]
-        await self.client(ChannelUpdateUsername(channel=new_chat, username=uname))
-        return new_chat.id, f"https://t.me/{uname}"
+            if client:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
 
-    # ---------- adaptive polling ----------
+            active_monitors.pop(user_id, None)
 
-    def _increase_interval(self):
-        if not self.adaptive_enabled:
-            return
-        self._consecutive_ok = 0
-        self.current_interval = min(self.current_interval * 1.7, MAX_INTERVAL)
+        if user_id not in monitor_tasks:
+            break
 
-    def _decay_interval(self):
-        if not self.adaptive_enabled:
-            return
-        self._consecutive_ok += 1
-        if self._consecutive_ok >= 5 and self.current_interval > self.base_interval:
-            self._consecutive_ok = 0
-            self.current_interval = max(self.base_interval, self.current_interval * 0.85)
+        await asyncio.sleep(retry_delay)
+        retry_delay = min(retry_delay * 2, max_delay)
 
-    def status_snapshot(self) -> dict:
-        return {
-            "logged_in": self.client is not None,
-            "account_label": self.account_label,
-            "is_active": self.is_active,
-            "base_interval": self.base_interval,
-            "current_interval": round(self.current_interval, 2),
-            "adaptive_enabled": self.adaptive_enabled,
-            "floodwait_auto": self.floodwait_auto,
-            "target_type": self.target_type,
-            "total_checks": self.total_checks,
-            "last_check_time": self.last_check_time,
-            "last_floodwait": self.last_floodwait,
-        }
+def start_monitoring(user_id: int, session_string: str) -> None:
+    old = monitor_tasks.get(user_id)
 
+    if old and not old.done():
+        old.cancel()
 
-# ===========================================================================
-# Login manager — interactive phone / code / password flow
-# ===========================================================================
+    task = asyncio.create_task(
+        monitor_loop(user_id, session_string),
+        name=f"monitor_{user_id}",
+    )
+    monitor_tasks[user_id] = task
 
-class LoginManager:
-    """
-    Drives an interactive Telegram login using a temporary Telethon client.
-    The bot asks for the phone number, sends the code, then asks the user to
-    type the code back (and the 2FA password if the account has one).
-    """
+def stop_monitoring(user_id: int) -> None:
+    task = monitor_tasks.pop(user_id, None)
 
-    def __init__(self, db: Database):
-        self.db = db
-        self.pending_client: Optional[TelegramClient] = None
-        self.pending_phone: Optional[str] = None
-        self.pending_hash: Optional[str] = None
+    if task and not task.done():
+        task.cancel()
 
-    def in_progress(self) -> bool:
-        return self.pending_client is not None
+    client = active_monitors.pop(user_id, None)
 
-    async def start_login(self, phone: str):
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
-        await client.connect()
-        sent = await client.send_code_request(phone)
-        self.pending_client = client
-        self.pending_phone = phone
-        self.pending_hash = sent.phone_code_hash
+    if client:
+        asyncio.create_task(client.disconnect())
 
-    async def submit_code(self, code: str) -> str:
-        """Returns one of: success, need_password, invalid, expired."""
+# ============================================================
+# Login flow
+# ============================================================
+
+def get_login_lock(user_id: int) -> asyncio.Lock:
+    lock = login_locks.get(user_id)
+
+    if lock is None:
+        lock = asyncio.Lock()
+        login_locks[user_id] = lock
+
+    return lock
+
+async def cleanup_login_client(user_id: int) -> None:
+    client = login_clients.pop(user_id, None)
+
+    if client:
         try:
-            await self.pending_client.sign_in(
-                phone=self.pending_phone, code=code, phone_code_hash=self.pending_hash
-            )
-            return "success"
-        except SessionPasswordNeededError:
-            return "need_password"
-        except PhoneCodeInvalidError:
-            return "invalid"
-        except PhoneCodeExpiredError:
-            return "expired"
-
-    async def submit_password(self, password: str) -> str:
-        """Returns one of: success, invalid."""
-        try:
-            await self.pending_client.sign_in(password=password)
-            return "success"
-        except PasswordHashInvalidError:
-            return "invalid"
-
-    async def finalize(self) -> tuple[TelegramClient, str, str]:
-        """Call after a successful sign-in. Returns (client, session_string, label)."""
-        client = self.pending_client
-        session_str = client.session.save()
-        me = await client.get_me()
-        label = f"@{me.username}" if me.username else (me.phone or str(me.id))
-        await self.db.set_setting("session_string", session_str)
-        self.pending_client = None
-        self.pending_phone = None
-        self.pending_hash = None
-        return client, session_str, label
-
-    async def cancel(self):
-        if self.pending_client:
-            await self.pending_client.disconnect()
-        self.pending_client = None
-        self.pending_phone = None
-        self.pending_hash = None
-
-
-# ===========================================================================
-# Bot UI
-# ===========================================================================
-
-router = Router()
-
-STATUS_LABEL = {
-    "watching": "WATCHING",
-    "stopped": "STOPPED",
-    "assigned": "ASSIGNED",
-    "invalid": "INVALID",
-}
-
-
-class Form(StatesGroup):
-    waiting_username = State()
-    waiting_delete = State()
-    waiting_custom_interval = State()
-    waiting_phone = State()
-    waiting_code = State()
-    waiting_password = State()
-    waiting_session_string = State()
-
-
-def _only_owner(obj) -> bool:
-    user = obj.from_user
-    return user is not None and user.id == OWNER_ID
-
-
-def main_menu_kb():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Start Monitoring", callback_data="start_monitor")
-    kb.button(text="Stop Monitoring", callback_data="stop_monitor")
-    kb.button(text="Add Username", callback_data="add_username")
-    kb.button(text="Delete Username", callback_data="delete_username")
-    kb.button(text="List Usernames", callback_data="list_usernames")
-    kb.button(text="Manual Check", callback_data="manual_check")
-    kb.button(text="System Status", callback_data="system_status")
-    kb.button(text="Settings", callback_data="settings_menu")
-    kb.button(text="Account", callback_data="account_menu")
-    kb.adjust(2, 2, 2, 2, 1)
-    return kb.as_markup()
-
-
-def settings_menu_kb(adaptive: bool, floodwait_auto: bool, target_type: str):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="1 second", callback_data="set_interval:1")
-    kb.button(text="2 seconds", callback_data="set_interval:2")
-    kb.button(text="3 seconds", callback_data="set_interval:3")
-    kb.button(text="5 seconds", callback_data="set_interval:5")
-    kb.button(text="Custom value", callback_data="set_interval:custom")
-    kb.button(
-        text=f"Adaptive Polling: {'ON' if adaptive else 'OFF'}",
-        callback_data="toggle_adaptive",
-    )
-    kb.button(
-        text=f"Auto FloodWait handling: {'ON' if floodwait_auto else 'OFF'}",
-        callback_data="toggle_floodwait",
-    )
-    kb.button(
-        text=f"Claim target: {'Channel' if target_type == 'channel' else 'Group'}",
-        callback_data="toggle_target_type",
-    )
-    kb.button(text="Back", callback_data="back_main")
-    kb.adjust(2, 2, 1, 1, 1, 1)
-    return kb.as_markup()
-
-
-def account_menu_kb(logged_in: bool):
-    kb = InlineKeyboardBuilder()
-    if logged_in:
-        kb.button(text="Logout", callback_data="account_logout")
-    else:
-        kb.button(text="Login with phone", callback_data="account_login")
-        kb.button(text="Paste session string", callback_data="account_login_string")
-    kb.button(text="Back", callback_data="back_main")
-    kb.adjust(1, 1, 1)
-    return kb.as_markup()
-
-
-def back_kb():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Back to control panel", callback_data="back_main")
-    return kb.as_markup()
-
-
-def cancel_login_kb():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Cancel login", callback_data="account_cancel_login")
-    return kb.as_markup()
-
-
-# ---------- basic commands ----------
-
-@router.message(Command("start"))
-async def cmd_start(message: Message):
-    if not _only_owner(message):
-        return
-    await message.answer(
-        "Username monitor control panel\n\nChoose an action below:",
-        reply_markup=main_menu_kb(),
-    )
-
-
-@router.callback_query(F.data == "back_main")
-async def cb_back_main(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await cb.message.edit_text("Username monitor control panel", reply_markup=main_menu_kb())
-    await cb.answer()
-
-
-# ---------- start / stop ----------
-
-@router.callback_query(F.data == "start_monitor")
-async def cb_start(cb: CallbackQuery, engine: MonitorEngine):
-    if not _only_owner(cb):
-        return await cb.answer("Not allowed", show_alert=True)
-    if engine.client is None:
-        return await cb.answer("Log in to an account first (Account > Login).", show_alert=True)
-    watching = await engine.db.get_watching_usernames()
-    if not watching:
-        return await cb.answer("No usernames are being watched — add one first.", show_alert=True)
-    engine.start()
-    await cb.answer("Monitoring started")
-    await cb.message.edit_text("Monitoring is running.", reply_markup=main_menu_kb())
-
-
-@router.callback_query(F.data == "stop_monitor")
-async def cb_stop(cb: CallbackQuery, engine: MonitorEngine):
-    if not _only_owner(cb):
-        return await cb.answer("Not allowed", show_alert=True)
-    engine.stop()
-    await cb.answer("Monitoring stopped")
-    await cb.message.edit_text("Monitoring is stopped.", reply_markup=main_menu_kb())
-
-
-# ---------- add username ----------
-
-@router.callback_query(F.data == "add_username")
-async def cb_add(cb: CallbackQuery, state: FSMContext):
-    if not _only_owner(cb):
-        return await cb.answer("Not allowed", show_alert=True)
-    await state.set_state(Form.waiting_username)
-    await cb.message.edit_text("Send the username to watch (with or without @):", reply_markup=back_kb())
-    await cb.answer()
-
-
-@router.message(Form.waiting_username)
-async def on_add_username(message: Message, state: FSMContext, engine: MonitorEngine):
-    if not _only_owner(message):
-        return
-    uname = message.text.strip().lstrip("@")
-    if not uname.replace("_", "").isalnum():
-        return await message.answer("Invalid username, try again or press Back.", reply_markup=back_kb())
-    added = await engine.db.add_username(uname)
-    await state.clear()
-    if added:
-        await message.answer(f"@{uname} added to the watch list.", reply_markup=main_menu_kb())
-    else:
-        await message.answer(f"@{uname} is already in the list.", reply_markup=main_menu_kb())
-
-
-# ---------- delete username ----------
-
-@router.callback_query(F.data == "delete_username")
-async def cb_delete(cb: CallbackQuery, state: FSMContext):
-    if not _only_owner(cb):
-        return await cb.answer("Not allowed", show_alert=True)
-    await state.set_state(Form.waiting_delete)
-    await cb.message.edit_text("Send the username to delete:", reply_markup=back_kb())
-    await cb.answer()
-
-
-@router.message(Form.waiting_delete)
-async def on_delete_username(message: Message, state: FSMContext, engine: MonitorEngine):
-    if not _only_owner(message):
-        return
-    uname = message.text.strip().lstrip("@")
-    removed = await engine.db.remove_username(uname)
-    await state.clear()
-    if removed:
-        await message.answer(f"@{uname} removed from the list.", reply_markup=main_menu_kb())
-    else:
-        await message.answer(f"@{uname} was not found in the list.", reply_markup=main_menu_kb())
-
-
-# ---------- list usernames ----------
-
-@router.callback_query(F.data == "list_usernames")
-async def cb_list(cb: CallbackQuery, engine: MonitorEngine):
-    if not _only_owner(cb):
-        return await cb.answer("Not allowed", show_alert=True)
-    rows = await engine.db.list_usernames()
-    if not rows:
-        await cb.message.edit_text("The list is empty.", reply_markup=main_menu_kb())
-        return await cb.answer()
-
-    lines = ["Username list:\n"]
-    for r in rows:
-        label = STATUS_LABEL.get(r["status"], r["status"])
-        line = f"@{r['username']} — {label} — checks: {r['checks_count']}"
-        if r["status"] == "assigned" and r["channel_link"]:
-            line += f"\n   {r['channel_link']}"
-        lines.append(line)
-    await cb.message.edit_text("\n".join(lines), reply_markup=main_menu_kb())
-    await cb.answer()
-
-
-# ---------- manual check ----------
-
-@router.callback_query(F.data == "manual_check")
-async def cb_manual_check(cb: CallbackQuery, engine: MonitorEngine):
-    if not _only_owner(cb):
-        return await cb.answer("Not allowed", show_alert=True)
-    if engine.client is None:
-        return await cb.answer("Log in to an account first (Account > Login).", show_alert=True)
-    usernames = await engine.db.get_watching_usernames()
-    if not usernames:
-        return await cb.answer("No usernames are being watched.", show_alert=True)
-    await cb.answer("Checking now...")
-    for uname in usernames:
-        await engine.check_username(uname)
-    await cb.message.edit_text("Manual check finished for all watched usernames.", reply_markup=main_menu_kb())
-
-
-# ---------- system status ----------
-
-@router.callback_query(F.data == "system_status")
-async def cb_status(cb: CallbackQuery, engine: MonitorEngine):
-    if not _only_owner(cb):
-        return await cb.answer("Not allowed", show_alert=True)
-    s = engine.status_snapshot()
-    stats = await engine.db.get_stats()
-
-    last_check = "-"
-    if s["last_check_time"]:
-        last_check = datetime.fromtimestamp(s["last_check_time"], tz=timezone.utc).strftime("%H:%M:%S UTC")
-
-    flood_line = "none"
-    if s["last_floodwait"]:
-        ago = int(time.time() - s["last_floodwait"]["at"])
-        flood_line = f"{s['last_floodwait']['seconds']}s ({ago}s ago)"
-
-    text = (
-        "System status\n\n"
-        f"Account: {s['account_label']}\n"
-        f"Monitoring: {'RUNNING' if s['is_active'] else 'STOPPED'}\n"
-        f"Base interval: {s['base_interval']}s\n"
-        f"Current interval (adaptive): {s['current_interval']}s\n"
-        f"Adaptive polling: {'ON' if s['adaptive_enabled'] else 'OFF'}\n"
-        f"Auto FloodWait handling: {'ON' if s['floodwait_auto'] else 'OFF'}\n"
-        f"Claim target: {s['target_type']}\n"
-        f"Last FloodWait: {flood_line}\n"
-        f"Checks this session: {s['total_checks']}\n"
-        f"Last check: {last_check}\n\n"
-        f"Total usernames: {stats.get('total') or 0}\n"
-        f"Watching: {stats.get('watching') or 0}\n"
-        f"Assigned: {stats.get('assigned') or 0}\n"
-        f"Total checks (all time): {stats.get('total_checks') or 0}\n"
-    )
-    await cb.message.edit_text(text, reply_markup=main_menu_kb())
-    await cb.answer()
-
-
-# ---------- settings ----------
-
-@router.callback_query(F.data == "settings_menu")
-async def cb_settings(cb: CallbackQuery, engine: MonitorEngine):
-    if not _only_owner(cb):
-        return await cb.answer("Not allowed", show_alert=True)
-    await cb.message.edit_text(
-        "Monitoring settings",
-        reply_markup=settings_menu_kb(engine.adaptive_enabled, engine.floodwait_auto, engine.target_type),
-    )
-    await cb.answer()
-
-
-@router.callback_query(F.data.startswith("set_interval:"))
-async def cb_set_interval(cb: CallbackQuery, state: FSMContext, engine: MonitorEngine):
-    if not _only_owner(cb):
-        return await cb.answer("Not allowed", show_alert=True)
-    value = cb.data.split(":", 1)[1]
-    if value == "custom":
-        await state.set_state(Form.waiting_custom_interval)
-        await cb.message.edit_text("Send the custom interval in seconds (example: 4.5):", reply_markup=back_kb())
-        return await cb.answer()
-
-    await engine.set_interval(float(value))
-    await cb.answer(f"Interval set to {value} seconds")
-    await cb.message.edit_text(
-        "Monitoring settings",
-        reply_markup=settings_menu_kb(engine.adaptive_enabled, engine.floodwait_auto, engine.target_type),
-    )
-
-
-@router.message(Form.waiting_custom_interval)
-async def on_custom_interval(message: Message, state: FSMContext, engine: MonitorEngine):
-    if not _only_owner(message):
-        return
-    try:
-        value = float(message.text.strip())
-        if value <= 0:
-            raise ValueError
-    except ValueError:
-        return await message.answer("Invalid value, send a positive number (example: 4.5).", reply_markup=back_kb())
-
-    await engine.set_interval(value)
-    await state.clear()
-    await message.answer(
-        f"Custom interval set to {value} seconds.",
-        reply_markup=settings_menu_kb(engine.adaptive_enabled, engine.floodwait_auto, engine.target_type),
-    )
-
-
-@router.callback_query(F.data == "toggle_adaptive")
-async def cb_toggle_adaptive(cb: CallbackQuery, engine: MonitorEngine):
-    if not _only_owner(cb):
-        return await cb.answer("Not allowed", show_alert=True)
-    await engine.set_adaptive(not engine.adaptive_enabled)
-    await cb.answer()
-    await cb.message.edit_text(
-        "Monitoring settings",
-        reply_markup=settings_menu_kb(engine.adaptive_enabled, engine.floodwait_auto, engine.target_type),
-    )
-
-
-@router.callback_query(F.data == "toggle_floodwait")
-async def cb_toggle_floodwait(cb: CallbackQuery, engine: MonitorEngine):
-    if not _only_owner(cb):
-        return await cb.answer("Not allowed", show_alert=True)
-    await engine.set_floodwait_auto(not engine.floodwait_auto)
-    await cb.answer()
-    await cb.message.edit_text(
-        "Monitoring settings",
-        reply_markup=settings_menu_kb(engine.adaptive_enabled, engine.floodwait_auto, engine.target_type),
-    )
-
-
-@router.callback_query(F.data == "toggle_target_type")
-async def cb_toggle_target_type(cb: CallbackQuery, engine: MonitorEngine):
-    if not _only_owner(cb):
-        return await cb.answer("Not allowed", show_alert=True)
-    new_type = "group" if engine.target_type == "channel" else "channel"
-    await engine.set_target_type(new_type)
-    await cb.answer(f"Claim target set to: {new_type}")
-    await cb.message.edit_text(
-        "Monitoring settings",
-        reply_markup=settings_menu_kb(engine.adaptive_enabled, engine.floodwait_auto, engine.target_type),
-    )
-
-
-# ---------- account / login flow ----------
-
-@router.callback_query(F.data == "account_menu")
-async def cb_account_menu(cb: CallbackQuery, engine: MonitorEngine):
-    if not _only_owner(cb):
-        return await cb.answer("Not allowed", show_alert=True)
-    logged_in = engine.client is not None
-    text = f"Account\n\nStatus: {'logged in as ' + engine.account_label if logged_in else 'not logged in'}"
-    await cb.message.edit_text(text, reply_markup=account_menu_kb(logged_in))
-    await cb.answer()
-
-
-@router.callback_query(F.data == "account_login")
-async def cb_account_login(cb: CallbackQuery, state: FSMContext, engine: MonitorEngine, login: LoginManager):
-    if not _only_owner(cb):
-        return await cb.answer("Not allowed", show_alert=True)
-    if engine.client is not None:
-        return await cb.answer("Already logged in. Logout first to switch accounts.", show_alert=True)
-    await state.set_state(Form.waiting_phone)
-    await cb.message.edit_text(
-        "Send the phone number of the account to monitor, in international format "
-        "(example: +15551234567):",
-        reply_markup=cancel_login_kb(),
-    )
-    await cb.answer()
-
-
-@router.callback_query(F.data == "account_login_string")
-async def cb_account_login_string(cb: CallbackQuery, state: FSMContext, engine: MonitorEngine):
-    if not _only_owner(cb):
-        return await cb.answer("Not allowed", show_alert=True)
-    if engine.client is not None:
-        return await cb.answer("Already logged in. Logout first to switch accounts.", show_alert=True)
-    await state.set_state(Form.waiting_session_string)
-    await cb.message.edit_text(
-        "Send the session string. It will be stored and used directly, no phone "
-        "number or code needed.",
-        reply_markup=cancel_login_kb(),
-    )
-    await cb.answer()
-
-
-@router.message(Form.waiting_session_string)
-async def on_session_string(message: Message, state: FSMContext, engine: MonitorEngine, login: LoginManager):
-    if not _only_owner(message):
-        return
-    raw = message.text.strip()
-    try:
-        client = TelegramClient(StringSession(raw), API_ID, API_HASH)
-        await client.connect()
-        if not await client.is_user_authorized():
             await client.disconnect()
-            return await message.answer(
-                "That session string is not authorized (expired or invalid). Try again "
-                "or use Login with phone instead.",
-                reply_markup=cancel_login_kb(),
-            )
-        me = await client.get_me()
-        label = f"@{me.username}" if me.username else (me.phone or str(me.id))
-        await engine.db.set_setting("session_string", raw)
-        engine.attach_client(client, label)
-    except Exception as e:  # noqa: BLE001
-        return await message.answer(f"Could not use that session string:\n{e}", reply_markup=cancel_login_kb())
+        except Exception:
+            pass
 
-    await state.clear()
-    await message.answer(f"Logged in as {label}.", reply_markup=main_menu_kb())
+async def begin_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
 
-
-@router.callback_query(F.data == "account_cancel_login")
-async def cb_account_cancel_login(cb: CallbackQuery, state: FSMContext, login: LoginManager):
-    if not _only_owner(cb):
-        return await cb.answer("Not allowed", show_alert=True)
-    await login.cancel()
-    await state.clear()
-    await cb.message.edit_text("Login cancelled.", reply_markup=main_menu_kb())
-    await cb.answer()
-
-
-@router.callback_query(F.data == "account_logout")
-async def cb_account_logout(cb: CallbackQuery, engine: MonitorEngine):
-    if not _only_owner(cb):
-        return await cb.answer("Not allowed", show_alert=True)
-    await engine.detach_client()
-    await engine.db.set_setting("session_string", "")
-    await cb.answer("Logged out")
-    await cb.message.edit_text("Logged out.", reply_markup=main_menu_kb())
-
-
-@router.message(Form.waiting_phone)
-async def on_phone(message: Message, state: FSMContext, login: LoginManager):
-    if not _only_owner(message):
+    if not is_allowed(user_id):
         return
-    phone = message.text.strip()
-    try:
-        await login.start_login(phone)
-    except PhoneNumberInvalidError:
-        return await message.answer("Invalid phone number, try again.", reply_markup=cancel_login_kb())
-    except FloodWaitError as e:
-        await state.clear()
-        return await message.answer(f"FloodWait: try again in {e.seconds} seconds.", reply_markup=main_menu_kb())
-    except Exception as e:  # noqa: BLE001
-        await state.clear()
-        return await message.answer(f"Login failed:\n{e}", reply_markup=main_menu_kb())
 
-    await state.set_state(Form.waiting_code)
-    await message.answer(
-        "Enter the login code Telegram just sent to that account:",
-        reply_markup=cancel_login_kb(),
-    )
-
-
-@router.message(Form.waiting_code)
-async def on_code(message: Message, state: FSMContext, engine: MonitorEngine, login: LoginManager):
-    if not _only_owner(message):
-        return
-    code = message.text.strip()
-    result = await login.submit_code(code)
-
-    if result == "need_password":
-        await state.set_state(Form.waiting_password)
-        return await message.answer(
-            "This account has Two-Step Verification. Enter the password:",
-            reply_markup=cancel_login_kb(),
+    if get_user(user_id):
+        await update.message.reply_text(
+            "توجد جلسة محفوظة لهذا الحساب.\n"
+            "امسح الجلسة الحالية أولاً إذا كنت تريد تسجيل الدخول من جديد.",
+            reply_markup=back_keyboard(),
         )
-    if result == "invalid":
-        return await message.answer("Invalid code, try again.", reply_markup=cancel_login_kb())
-    if result == "expired":
-        await state.clear()
-        return await message.answer("Code expired. Please start the login again.", reply_markup=main_menu_kb())
-
-    # success
-    client, session_str, label = await login.finalize()
-    engine.attach_client(client, label)
-    await state.clear()
-    await message.answer(
-        f"Logged in as {label}.\n\n"
-        f"Save this session string as the SESSION_STRING environment variable "
-        f"so you don't have to log in again after a redeploy:\n\n"
-        f"{session_str}",
-        reply_markup=main_menu_kb(),
-    )
-
-
-@router.message(Form.waiting_password)
-async def on_password(message: Message, state: FSMContext, engine: MonitorEngine, login: LoginManager):
-    if not _only_owner(message):
         return
-    password = message.text.strip()
-    result = await login.submit_password(password)
 
-    if result == "invalid":
-        return await message.answer("Wrong password, try again.", reply_markup=cancel_login_kb())
+    context.user_data["state"] = LOGIN_PHONE
 
-    client, session_str, label = await login.finalize()
-    engine.attach_client(client, label)
-    await state.clear()
-    await message.answer(
-        f"Logged in as {label}.\n\n"
-        f"Save this session string as the SESSION_STRING environment variable "
-        f"so you don't have to log in again after a redeploy:\n\n"
-        f"{session_str}",
-        reply_markup=main_menu_kb(),
+    await update.message.reply_text(
+        "أرسل رقم الهاتف مع رمز الدولة.\n\n"
+        "مثال:\n"
+        "+9647xxxxxxxxx\n\n"
+        "لا ترسل كلمة مرور حسابك إلى أي شخص."
     )
 
+async def handle_login_phone(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    user_id = update.effective_user.id
+    phone = update.message.text.strip()
 
-# ===========================================================================
-# Entry point
-# ===========================================================================
+    if not re.fullmatch(r"\+\d{7,15}", phone):
+        await update.message.reply_text(
+            "رقم الهاتف غير صحيح.\n"
+            "أرسله بصيغة دولية مثل +9647xxxxxxxxx."
+        )
+        return
 
-async def run():
-    errors = validate_config()
-    if errors:
-        log.error("Missing configuration:\n- " + "\n- ".join(errors))
-        sys.exit(1)
+    lock = get_login_lock(user_id)
 
-    db = Database(DB_PATH)
-    await db.init(
-        defaults={
-            "interval": DEFAULT_INTERVAL,
-            "adaptive": "1" if DEFAULT_ADAPTIVE else "0",
-            "floodwait_auto": "1" if DEFAULT_FLOODWAIT_AUTO else "0",
-            "target_type": DEFAULT_TARGET_TYPE,
-        }
-    )
+    async with lock:
+        await cleanup_login_client(user_id)
 
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
+        client = make_client()
+        login_clients[user_id] = client
 
-    async def notify(text: str):
         try:
-            await bot.send_message(OWNER_ID, text)
-        except Exception:  # noqa: BLE001
-            log.exception("Failed to send notification")
+            await asyncio.wait_for(client.connect(), timeout=60)
+            await client.send_code_request(phone)
 
-    engine = MonitorEngine(db, notify)
-    await engine.load_settings()
-    login = LoginManager(db)
+            context.user_data["phone"] = phone
+            context.user_data["state"] = LOGIN_CODE
 
-    # Try to restore a session automatically: env var takes priority over the
-    # one saved in the database from a previous interactive login.
-    session_str = SESSION_STRING_ENV or await db.get_setting("session_string", "")
-    if session_str:
-        try:
-            client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-            await client.start()
-            me = await client.get_me()
-            label = f"@{me.username}" if me.username else (me.phone or str(me.id))
-            engine.attach_client(client, label)
-            log.info("Restored session for account: %s", label)
-        except Exception:  # noqa: BLE001
-            log.exception("Failed to restore saved session — use the Login button in the bot instead")
+            await update.message.reply_text(
+                "تم إرسال رمز التحقق.\n\n"
+                "أرسل الرمز كما وصلك، ويمكنك وضع نقطة بين الأرقام."
+            )
 
-    dp["engine"] = engine
-    dp["login"] = login
+        except PhoneNumberInvalidError:
+            await update.message.reply_text("رقم الهاتف غير صالح.")
+            await cleanup_login_client(user_id)
+            context.user_data.clear()
 
-    await notify(
-        "Username monitor bot is online. Send /start to open the control panel."
-        + ("" if engine.client else "\nNo account is logged in yet — use Account > Login.")
-    )
+        except FloodWaitError as exc:
+            await update.message.reply_text(
+                f"يجب الانتظار {exc.seconds} ثانية قبل المحاولة مجدداً."
+            )
+            await cleanup_login_client(user_id)
+            context.user_data.clear()
+
+        except Exception as exc:
+            add_log(user_id, "login_code_error", str(exc))
+            await update.message.reply_text(
+                "تعذر إرسال رمز التحقق. حاول مرة أخرى."
+            )
+            await cleanup_login_client(user_id)
+            context.user_data.clear()
+
+async def complete_login(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    code: str,
+) -> bool:
+    user_id = update.effective_user.id
+    phone = context.user_data.get("phone")
+    client = login_clients.get(user_id)
+
+    if not phone or not client:
+        await update.message.reply_text(
+            "انتهت جلسة تسجيل الدخول. ابدأ العملية من جديد."
+        )
+        context.user_data.clear()
+        await cleanup_login_client(user_id)
+        return False
 
     try:
-        await dp.start_polling(bot)
-    finally:
-        engine.stop()
-        if engine.client:
-            await engine.client.disconnect()
-        await db.close()
+        await client.sign_in(phone=phone, code=code)
 
+        session_string = client.session.save()
+        set_user(user_id, phone, session_string)
+
+        await cleanup_login_client(user_id)
+        context.user_data.clear()
+
+        start_monitoring(user_id, session_string)
+
+        await update.message.reply_text(
+            "تم تسجيل الدخول بنجاح.\n\n"
+            "الحماية الآن قيد التشغيل.",
+            reply_markup=main_keyboard(user_id),
+        )
+        return True
+
+    except SessionPasswordNeededError:
+        context.user_data["state"] = LOGIN_PASSWORD
+        await update.message.reply_text(
+            "الحساب محمي بالتحقق بخطوتين.\n"
+            "أرسل كلمة مرور التحقق بخطوتين."
+        )
+        return False
+
+    except PhoneCodeInvalidError:
+        await update.message.reply_text(
+            "رمز التحقق غير صحيح. أرسل الرمز الصحيح."
+        )
+        return False
+
+    except FATAL_SESSION_ERRORS as exc:
+        await update.message.reply_text(
+            "تعذر إكمال تسجيل الدخول بسبب مشكلة في الجلسة."
+        )
+        add_log(user_id, "login_fatal", str(exc))
+        await cleanup_login_client(user_id)
+        context.user_data.clear()
+        return False
+
+    except Exception as exc:
+        add_log(user_id, "login_error", str(exc))
+        await update.message.reply_text(
+            "فشل تسجيل الدخول. ابدأ العملية من جديد."
+        )
+        await cleanup_login_client(user_id)
+        context.user_data.clear()
+        return False
+
+async def complete_password(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    user_id = update.effective_user.id
+    client = login_clients.get(user_id)
+    phone = context.user_data.get("phone")
+
+    if not client or not phone:
+        await update.message.reply_text(
+            "انتهت جلسة تسجيل الدخول. ابدأ من جديد."
+        )
+        context.user_data.clear()
+        await cleanup_login_client(user_id)
+        return
+
+    try:
+        await client.sign_in(password=update.message.text)
+
+        session_string = client.session.save()
+        set_user(user_id, phone, session_string)
+
+        await cleanup_login_client(user_id)
+        context.user_data.clear()
+
+        start_monitoring(user_id, session_string)
+
+        await update.message.reply_text(
+            "تم تسجيل الدخول بنجاح.\n\n"
+            "الحماية الآن قيد التشغيل.",
+            reply_markup=main_keyboard(user_id),
+        )
+
+    except Exception as exc:
+        add_log(user_id, "password_error", str(exc))
+        await update.message.reply_text(
+            "كلمة المرور غير صحيحة أو تعذر التحقق منها.\n"
+            "حاول مرة أخرى."
+        )
+
+# ============================================================
+# Scanning
+# ============================================================
+
+async def scan_old_messages(user_id: int) -> int:
+    user_data = get_user(user_id)
+
+    if not user_data:
+        raise RuntimeError("NO_SESSION")
+
+    client = make_client(user_data["session_string"])
+    count = 0
+
+    try:
+        await asyncio.wait_for(client.connect(), timeout=60)
+
+        if not await client.is_user_authorized():
+            raise RuntimeError("INVALID_SESSION")
+
+        service = await get_telegram_service(client)
+
+        if not service:
+            raise RuntimeError("TELEGRAM_SERVICE_NOT_FOUND")
+
+        async for message in client.iter_messages(service, limit=200):
+            if not message.raw_text or not message.buttons:
+                continue
+
+            try:
+                chat_name, _ = extract_chat_info(message.raw_text)
+                await message.buttons[0][0].click()
+
+                if load_data()["settings"].get("auto_leave", True):
+                    await try_leave_chat(client, chat_name, user_id)
+
+                count += 1
+                await asyncio.sleep(0.35)
+
+            except FloodWaitError as exc:
+                await asyncio.sleep(min(exc.seconds, 300))
+            except Exception:
+                continue
+
+        return count
+
+    finally:
+        await client.disconnect()
+
+# ============================================================
+# Telegram bot handlers
+# ============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user is None:
+        return
+
+    await send_start(
+        update.message,
+        update.effective_user.id,
+    )
+
+async def button_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    user_id = update.effective_user.id
+    data = query.data or ""
+
+    await query.answer()
+
+    if not is_allowed(user_id):
+        await safe_edit(
+            query,
+            "هذا البوت غير متاح لحسابك.",
+        )
+        return
+
+    if data == "main":
+        context.user_data.clear()
+        await send_start(query.message, user_id, query=query)
+        return
+
+    if data == "login":
+        if get_user(user_id):
+            await safe_edit(
+                query,
+                "توجد جلسة محفوظة بالفعل.\n"
+                "استخدم إدارة الجلسة لمسحها أولاً.",
+                back_keyboard(),
+            )
+        else:
+            context.user_data["state"] = LOGIN_PHONE
+            await safe_edit(
+                query,
+                "أرسل رقم الهاتف مع رمز الدولة.\n\n"
+                "مثال:\n"
+                "+9647xxxxxxxxx",
+                back_keyboard(),
+            )
+        return
+
+    if data == "session":
+        ud = get_user(user_id)
+
+        if not ud:
+            await safe_edit(
+                query,
+                "لا توجد جلسة محفوظة.",
+                InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("تسجيل الدخول", callback_data="login")],
+                        [InlineKeyboardButton("رجوع", callback_data="main")],
+                    ]
+                ),
+            )
+            return
+
+        connected = user_id in active_monitors
+        text = (
+            "<b>إدارة الجلسة</b>\n\n"
+            f"الحالة: {'متصلة' if connected else 'جاري الاتصال'}\n"
+            f"الحماية: {'متوقفة مؤقتاً' if ud.get('frozen') else 'مفعلة'}"
+        )
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("مسح الجلسة", callback_data="clear")],
+                [InlineKeyboardButton("رجوع", callback_data="main")],
+            ]
+        )
+
+        await safe_edit(query, text, keyboard)
+        return
+
+    if data == "clear":
+        stop_monitoring(user_id)
+        await cleanup_login_client(user_id)
+        delete_user(user_id)
+        context.user_data.clear()
+
+        add_log(user_id, "session_cleared")
+
+        await safe_edit(
+            query,
+            "تم مسح الجلسة وإيقاف الحماية لهذا الحساب.",
+            back_keyboard(),
+        )
+        return
+
+    if data == "status":
+        ud = get_user(user_id)
+
+        if not ud:
+            await safe_edit(
+                query,
+                "لا توجد جلسة مسجلة لهذا الحساب.",
+                InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("تسجيل الدخول", callback_data="login")],
+                        [InlineKeyboardButton("رجوع", callback_data="main")],
+                    ]
+                ),
+            )
+            return
+
+        frozen = bool(ud.get("frozen"))
+        connected = user_id in active_monitors
+
+        text = (
+            "<b>حالة الحماية</b>\n\n"
+            f"الجلسة: {'متصلة' if connected else 'إعادة اتصال'}\n"
+            f"الحماية: {'مجمّدة' if frozen else 'تعمل'}\n"
+            f"الخروج التلقائي: "
+            f"{'مفعل' if load_data()['settings'].get('auto_leave', True) else 'متوقف'}"
+        )
+
+        await safe_edit(
+            query,
+            text,
+            status_keyboard(frozen),
+        )
+        return
+
+    if data == "freeze":
+        ud = get_user(user_id)
+
+        if not ud:
+            await safe_edit(query, "لا توجد جلسة محفوظة.", back_keyboard())
+            return
+
+        new_value = not bool(ud.get("frozen"))
+        update_user(user_id, frozen=new_value)
+
+        add_log(
+            user_id,
+            "freeze_toggle",
+            "frozen" if new_value else "active",
+        )
+
+        await safe_edit(
+            query,
+            (
+                "تم تجميد الحماية.\n\n"
+                "لن يتم تنفيذ رفض تلقائي أثناء التجميد."
+                if new_value
+                else
+                "تم إلغاء تجميد الحماية.\n\n"
+                "عادت المراقبة للعمل."
+            ),
+            status_keyboard(new_value),
+        )
+        return
+
+    if data == "scan":
+        if not get_user(user_id):
+            await safe_edit(
+                query,
+                "يجب تسجيل الدخول أولاً.",
+                back_keyboard(),
+            )
+            return
+
+        await safe_edit(
+            query,
+            "<b>فحص الإشعارات القديمة</b>\n\n"
+            "سيتم فحص آخر 200 إشعار من Telegram الرسمي "
+            "ومعالجة إشعارات نقل الملكية التي يمكن التعامل معها.",
+            InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("بدء الفحص", callback_data="scan_confirm")],
+                    [InlineKeyboardButton("رجوع", callback_data="main")],
+                ]
+            ),
+        )
+        return
+
+    if data == "scan_confirm":
+        await safe_edit(
+            query,
+            "جاري الفحص. انتظر حتى تكتمل العملية.",
+        )
+
+        try:
+            count = await scan_old_messages(user_id)
+
+            await safe_edit(
+                query,
+                f"اكتمل الفحص.\n\nتمت معالجة {count} إشعاراً.",
+                back_keyboard(),
+            )
+
+        except RuntimeError as exc:
+            reason = str(exc)
+
+            if reason == "INVALID_SESSION":
+                await invalidate_session(
+                    user_id,
+                    "الجلسة غير صالحة",
+                )
+                await safe_edit(
+                    query,
+                    "الجلسة غير صالحة وتم حذفها. أعد تسجيل الدخول.",
+                    back_keyboard(),
+                )
+            elif reason == "TELEGRAM_SERVICE_NOT_FOUND":
+                await safe_edit(
+                    query,
+                    "تعذر الوصول إلى محادثة Telegram الرسمية.",
+                    back_keyboard(),
+                )
+            else:
+                await safe_edit(
+                    query,
+                    "لا توجد جلسة صالحة.",
+                    back_keyboard(),
+                )
+
+        except Exception as exc:
+            add_log(user_id, "scan_error", str(exc))
+            await safe_edit(
+                query,
+                "حدث خطأ أثناء الفحص. حاول مرة أخرى.",
+                back_keyboard(),
+            )
+        return
+
+    # Owner management
+    if data == "manage":
+        if user_id != OWNER_ID:
+            await safe_edit(query, "غير مصرح لك.")
+            return
+
+        users = list_allowed_users()
+
+        await safe_edit(
+            query,
+            (
+                "<b>لوحة المالك</b>\n\n"
+                f"المستخدمون المصرح لهم: {len(users)}\n"
+                f"الجلسات النشطة: {len(active_monitors)}"
+            ),
+            management_keyboard(),
+        )
+        return
+
+    if data == "manage_add":
+        if user_id != OWNER_ID:
+            await safe_edit(query, "غير مصرح لك.")
+            return
+
+        context.user_data["state"] = MANAGE_ADD_USER
+
+        await safe_edit(
+            query,
+            "أرسل Telegram ID للمستخدم الذي تريد إضافته.",
+            back_keyboard("manage"),
+        )
+        return
+
+    if data == "manage_remove":
+        if user_id != OWNER_ID:
+            await safe_edit(query, "غير مصرح لك.")
+            return
+
+        users = [
+            uid
+            for uid in list_allowed_users()
+            if uid != OWNER_ID
+        ]
+
+        if not users:
+            await safe_edit(
+                query,
+                "لا يوجد مستخدمون إضافيون.",
+                back_keyboard("manage"),
+            )
+            return
+
+        rows = [
+            [InlineKeyboardButton(str(uid), callback_data=f"mdel_{uid}")]
+            for uid in users
+        ]
+        rows.append(
+            [InlineKeyboardButton("رجوع", callback_data="manage")]
+        )
+
+        await safe_edit(
+            query,
+            "اختر المستخدم الذي تريد حذفه:",
+            InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if data == "manage_list":
+        if user_id != OWNER_ID:
+            await safe_edit(query, "غير مصرح لك.")
+            return
+
+        users = list_allowed_users()
+
+        if not users:
+            text = "لا يوجد مستخدمون مصرح لهم."
+        else:
+            lines = "\n".join(
+                f"{index}. <code>{uid}</code>"
+                for index, uid in enumerate(users, 1)
+            )
+            text = f"<b>المستخدمون</b>\n\n{lines}"
+
+        await safe_edit(
+            query,
+            text,
+            back_keyboard("manage"),
+        )
+        return
+
+    if data.startswith("mdel_"):
+        if user_id != OWNER_ID:
+            await safe_edit(query, "غير مصرح لك.")
+            return
+
+        try:
+            target_id = int(data.split("_", 1)[1])
+        except ValueError:
+            await safe_edit(query, "المعرف غير صالح.")
+            return
+
+        if target_id == OWNER_ID:
+            await safe_edit(
+                query,
+                "لا يمكن حذف المالك.",
+                back_keyboard("manage"),
+            )
+            return
+
+        stop_monitoring(target_id)
+        remove_allowed_user(target_id)
+
+        add_log(user_id, "remove_allowed", str(target_id))
+
+        await safe_edit(
+            query,
+            f"تم حذف المستخدم <code>{target_id}</code>.",
+            management_keyboard(),
+        )
+        return
+
+async def handle_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not update.effective_user or not update.message:
+        return
+
+    user_id = update.effective_user.id
+
+    if not is_allowed(user_id):
+        return
+
+    state = context.user_data.get("state")
+
+    if state is None:
+        return
+
+    text = update.message.text.strip()
+
+    if state == MANAGE_ADD_USER:
+        if user_id != OWNER_ID:
+            context.user_data.clear()
+            return
+
+        if not re.fullmatch(r"\d{3,15}", text):
+            await update.message.reply_text(
+                "أرسل Telegram ID صحيحاً، أرقام فقط."
+            )
+            return
+
+        target_id = int(text)
+
+        if target_id == OWNER_ID:
+            await update.message.reply_text(
+                "المالك موجود مسبقاً."
+            )
+        else:
+            add_allowed_user(target_id)
+            add_log(user_id, "add_allowed", str(target_id))
+            await update.message.reply_text(
+                f"تمت إضافة المستخدم {target_id}.",
+                reply_markup=management_keyboard(),
+            )
+
+        context.user_data.clear()
+        return
+
+    if state == LOGIN_PHONE:
+        await handle_login_phone(update, context)
+        return
+
+    if state == LOGIN_CODE:
+        code = re.sub(r"[.\s-]", "", text)
+
+        if not re.fullmatch(r"\d{5,8}", code):
+            await update.message.reply_text(
+                "رمز التحقق غير صالح. أرسل الأرقام فقط."
+            )
+            return
+
+        await complete_login(update, context, code)
+        return
+
+    if state == LOGIN_PASSWORD:
+        await complete_password(update, context)
+        return
+
+# ============================================================
+# Startup / shutdown
+# ============================================================
+
+async def restore_monitors() -> None:
+    data = load_data()
+
+    for uid_text, user_data in data.get("users", {}).items():
+        try:
+            user_id = int(uid_text)
+        except (TypeError, ValueError):
+            continue
+
+        session_string = user_data.get("session_string")
+
+        if not session_string:
+            continue
+
+        start_monitoring(user_id, session_string)
+
+async def cleanup() -> None:
+    for user_id in list(login_clients):
+        await cleanup_login_client(user_id)
+
+    tasks = list(monitor_tasks.values())
+
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    for client in list(active_monitors.values()):
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    active_monitors.clear()
+    monitor_tasks.clear()
+
+async def post_init(application: Application) -> None:
+    await restore_monitors()
+
+async def post_shutdown(application: Application) -> None:
+    await cleanup()
+
+def build_application() -> Application:
+    request = HTTPXRequest(
+        connection_pool_size=16,
+        connect_timeout=20.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=20.0,
+    )
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_text,
+        )
+    )
+
+    return application
+
+def main() -> None:
+    global app
+
+    app = build_application()
+
+    print("Protection bot is starting...")
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        close_loop=False,
+    )
 
 if __name__ == "__main__":
     try:
-        asyncio.run(run())
+        main()
     except KeyboardInterrupt:
-        pass
+        print("Bot stopped.")
+    except Exception as exc:
+        print(f"Fatal error: {exc}")
+        sys.exit(1)
