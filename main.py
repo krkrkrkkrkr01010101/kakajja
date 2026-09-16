@@ -208,13 +208,17 @@ def add_allowed_user(user_id: int) -> None:
     data["allowed"] = sorted(allowed)
     save_data(data)
 
-def remove_allowed_user(user_id: int) -> None:
+def remove_allowed_user(user_id: int, remove_session: bool = True) -> None:
     data = load_data()
     data["allowed"] = [
         str(x)
         for x in data.get("allowed", [])
         if str(x) != str(user_id) and str(x) != str(OWNER_ID)
     ]
+
+    if remove_session:
+        data["users"].pop(str(user_id), None)
+
     save_data(data)
 
 def list_allowed_users() -> list[int]:
@@ -227,13 +231,24 @@ def list_allowed_users() -> list[int]:
     return result
 
 def add_log(user_id: int, event_name: str, details: str = "") -> None:
-    # Bounded, simple local log. It never contains session strings or passwords.
+    # Local bounded log. It never contains session strings or passwords.
+    path = Path("activity.log")
     try:
-        with open("activity.log", "a", encoding="utf-8") as f:
-            f.write(
-                f"{datetime.now().isoformat()} | "
-                f"User {user_id} | {event_name} | {details[:500]}\n"
-            )
+        line = (
+            f"{datetime.now().isoformat()} | "
+            f"User {user_id} | {event_name} | {details[:500]}\n"
+        )
+
+        if path.exists() and path.stat().st_size > 512 * 1024:
+            try:
+                raw = path.read_text(encoding="utf-8", errors="ignore")
+                raw = raw[-256 * 1024:]
+                path.write_text(raw, encoding="utf-8")
+            except OSError:
+                pass
+
+        with path.open("a", encoding="utf-8") as f:
+            f.write(line)
     except OSError:
         pass
 
@@ -547,6 +562,49 @@ async def keepalive_task(
         except Exception as exc:
             add_log(user_id, "keepalive_error", str(exc))
 
+TRANSFER_TEXT_PATTERNS = (
+    r"ownership\s+transfer",
+    r"transfer\s+ownership",
+    r"ownership\s+of\s+the\s+(?:channel|group|supergroup)",
+    r"نقل\s+ملكية",
+    r"نقل\s+الملكية",
+    r"تحويل\s+ملكية",
+    r"تحويل\s+الملكية",
+)
+
+REJECT_BUTTON_PATTERNS = (
+    r"reject",
+    r"decline",
+    r"cancel",
+    r"deny",
+    r"رفض",
+    r"رفض\s+النقل",
+    r"رفض\s+الملكية",
+    r"إلغاء",
+    r"الغاء",
+)
+
+def is_ownership_transfer_message(text: str) -> bool:
+    if not text:
+        return False
+    return any(re.search(pattern, text, re.I | re.S) for pattern in TRANSFER_TEXT_PATTERNS)
+
+
+def find_rejection_button(message):
+    buttons = getattr(message, "buttons", None) or []
+
+    for row in buttons:
+        for button in row:
+            label = str(getattr(button, "text", "") or "").strip()
+            if not label:
+                continue
+
+            if any(re.search(pattern, label, re.I | re.S) for pattern in REJECT_BUTTON_PATTERNS):
+                return button
+
+    return None
+
+
 async def handle_transfer_event(
     event,
     user_id: int,
@@ -562,7 +620,24 @@ async def handle_transfer_event(
     message = event.message
     text = message.raw_text or ""
 
-    if not message.buttons:
+    # Never act merely because a Telegram service message has buttons.
+    if not is_ownership_transfer_message(text):
+        return
+
+    reject_button = find_rejection_button(message)
+    if reject_button is None:
+        add_log(
+            user_id,
+            "transfer_unhandled",
+            "Ownership-transfer text detected but no rejection button was identified",
+        )
+        await notify_user(
+            user_id,
+            client,
+            "<b>تنبيه حماية</b>\n\n"
+            "تم اكتشاف إشعار متعلق بنقل الملكية، لكن لم يتم العثور على زر الرفض بشكل آمن.\n"
+            "لم يتم الضغط على أي زر تلقائياً.",
+        )
         return
 
     add_log(user_id, "transfer_detected", "Ownership transfer detected")
@@ -571,9 +646,7 @@ async def handle_transfer_event(
     now = datetime.now()
 
     try:
-        # The first button is the Telegram confirmation/rejection action
-        # present in the service notification.
-        await message.buttons[0][0].click()
+        await reject_button.click()
 
         add_log(
             user_id,
@@ -603,6 +676,13 @@ async def handle_transfer_event(
         await asyncio.sleep(min(exc.seconds, 300))
     except Exception as exc:
         add_log(user_id, "transfer_error", str(exc))
+        await notify_user(
+            user_id,
+            client,
+            "<b>تعذر تنفيذ الحماية</b>\n\n"
+            "تم اكتشاف إشعار نقل ملكية، لكن تعذر تنفيذ زر الرفض.",
+        )
+
 
 async def monitor_loop(user_id: int, session_string: str) -> None:
     retry_delay = 5
@@ -942,12 +1022,18 @@ async def scan_old_messages(user_id: int) -> int:
             raise RuntimeError("TELEGRAM_SERVICE_NOT_FOUND")
 
         async for message in client.iter_messages(service, limit=200):
-            if not message.raw_text or not message.buttons:
+            text = message.raw_text or ""
+
+            if not is_ownership_transfer_message(text):
+                continue
+
+            reject_button = find_rejection_button(message)
+            if reject_button is None:
                 continue
 
             try:
-                chat_name, _ = extract_chat_info(message.raw_text)
-                await message.buttons[0][0].click()
+                chat_name, _ = extract_chat_info(text)
+                await reject_button.click()
 
                 if load_data()["settings"].get("auto_leave", True):
                     await try_leave_chat(client, chat_name, user_id)
@@ -957,13 +1043,15 @@ async def scan_old_messages(user_id: int) -> int:
 
             except FloodWaitError as exc:
                 await asyncio.sleep(min(exc.seconds, 300))
-            except Exception:
+            except Exception as exc:
+                add_log(user_id, "scan_item_error", str(exc))
                 continue
 
         return count
 
     finally:
         await client.disconnect()
+
 
 # ============================================================
 # Telegram bot handlers
@@ -1111,6 +1199,13 @@ async def button_callback(
         new_value = not bool(ud.get("frozen"))
         update_user(user_id, frozen=new_value)
 
+        if new_value:
+            stop_monitoring(user_id)
+        else:
+            refreshed = get_user(user_id)
+            if refreshed and refreshed.get("session_string"):
+                start_monitoring(user_id, refreshed["session_string"])
+
         add_log(
             user_id,
             "freeze_toggle",
@@ -1121,11 +1216,11 @@ async def button_callback(
             query,
             (
                 "تم تجميد الحماية.\n\n"
-                "لن يتم تنفيذ رفض تلقائي أثناء التجميد."
+                "تم إيقاف المراقبة مؤقتاً ولن يتم تنفيذ أي رفض تلقائي."
                 if new_value
                 else
                 "تم إلغاء تجميد الحماية.\n\n"
-                "عادت المراقبة للعمل."
+                "تمت إعادة تشغيل المراقبة."
             ),
             status_keyboard(new_value),
         )
@@ -1314,7 +1409,7 @@ async def button_callback(
             return
 
         stop_monitoring(target_id)
-        remove_allowed_user(target_id)
+        remove_allowed_user(target_id, remove_session=True)
 
         add_log(user_id, "remove_allowed", str(target_id))
 
@@ -1385,10 +1480,20 @@ async def handle_text(
             )
             return
 
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
         await complete_login(update, context, code)
         return
 
     if state == LOGIN_PASSWORD:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
         await complete_password(update, context)
         return
 
@@ -1408,6 +1513,9 @@ async def restore_monitors() -> None:
         session_string = user_data.get("session_string")
 
         if not session_string:
+            continue
+
+        if user_data.get("frozen"):
             continue
 
         start_monitoring(user_id, session_string)
