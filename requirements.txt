@@ -1,3 +1,2 @@
-telethon>=1.36.0
-aiogram>=3.4.1
-aiosqlite>=0.20.0
+python-telegram-bot>=22,<23
+Telethon>=1.42,<2
